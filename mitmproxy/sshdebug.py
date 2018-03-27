@@ -8,7 +8,7 @@ import logging
 import struct
 import textwrap
 import sys
-
+from Crypto.Util import number as cnumber
 try:
     from Crypto import Util
 except ImportError:
@@ -652,7 +652,7 @@ def get_mpint(payload, count=1):
     index = 0
     for _ in range(count):
         length, = struct.unpack('>L', payload[index:index+4])
-        mpints.append(Util.number.bytes_to_long(
+        mpints.append(cnumber.bytes_to_long(
             payload[index+4:index+4+length]))
         index += 4 + length
     return (mpints, payload[index:])
