@@ -1,0 +1,14 @@
+[wrapper]
+mitmproxy_executable = /usr/bin/mitmproxy_ssh
+pidfile = /var/mitmproxy.pid
+interface = eth0
+logfile = /dev/null
+loglevel = info
+daemonize = true
+
+[mitmproxy]
+target_host = localhost
+target_port = 22
+local_port = 2222
+turris_id = 0000000500000001
+tty_log = /dev/null

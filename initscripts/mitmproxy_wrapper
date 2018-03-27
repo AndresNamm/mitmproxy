@@ -1,0 +1,30 @@
+#!/bin/sh /etc/rc.common
+
+START=50
+
+PROG=/usr/bin/mitmproxy_wrapper
+CONFIG=/etc/mitmproxy_wrapper.conf
+PIDFILE=/var/mitmproxy_wrapper.pid
+
+has_ssh_keys() {
+    [ -f /etc/mitmkeys/id_rsa ]
+}
+
+fatal() {
+    echo "$@"
+    exit 1
+}
+
+start() {
+        has_ssh_keys || fatal "SSH keys not present, use mitmkeygen"
+
+        "$PROG" "$CONFIG"
+}
+
+stop() {
+        #we need pgkill, hence the - before pid
+        [ -f "$PIDFILE" ] || fatal "No pidfile present, daemon not running?"
+        /bin/kill -SIGTERM -$(cat "$PIDFILE")
+        rm -f "$PIDFILE"
+}
+

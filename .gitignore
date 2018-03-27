@@ -1,0 +1,10 @@
+**.swp
+**.pyc
+*.kpf
+
+extra/mitmproxy_wrapper.conf
+extra/mitmproxy_wrapper.pid
+extra/mitmproxy_wrapper.log
+
+build
+doc

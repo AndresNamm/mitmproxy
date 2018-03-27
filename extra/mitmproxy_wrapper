@@ -1,0 +1,285 @@
+#!/usr/bin/env python
+# -*- coding: UTF-8 -*-
+
+import sys
+import os
+import time
+import atexit
+import subprocess
+import logging
+import signal
+import socket
+import fcntl
+import struct
+
+from ConfigParser import SafeConfigParser
+
+daemonHandlers = []
+
+def signalHandler(signum, frame):
+    """
+    Call all handlers from daemonHandlers
+    """
+    for handler in daemonHandlers:
+        handler()
+    sys.exit(0)
+
+class Daemon(object):
+    """
+    A generic daemon class.
+
+    Usage: subclass the Daemon class and override the run() method
+    """
+    def __init__(self, pidfile, stdin='/dev/null', stdout='/dev/null', stderr='/dev/null'):
+        """
+        @param pidfile: filename where to write PID after doublefork
+        @param stdin: filename to redirect stdin to
+        @param stdout: filename to redirect stdout to
+        @param stderr: filename to redirect stderr to
+        """
+        self.stdin = stdin
+        self.stdout = stdout
+        self.stderr = stderr
+        self.pidfile = pidfile
+        self.forked = False
+
+    @staticmethod
+    def pidRunning(pid):
+        """ Check For the existence of a unix pid. """
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        else:
+            return True
+        
+    def daemonize(self):
+        """
+        Do the UNIX double-fork magic.
+        """
+        try: 
+            pid = os.fork() 
+            if pid > 0:
+                # exit first parent
+                sys.exit(0) 
+        except OSError, e: 
+            sys.stderr.write(
+                "fork #1 failed: %d (%s)\n" % (e.errno, e.strerror))
+            sys.exit(1)
+
+        # decouple from parent environment
+        os.chdir("/") 
+        os.setsid() 
+        os.umask(0) 
+
+        # do second fork
+        try: 
+            pid = os.fork() 
+            if pid > 0:
+                # exit from second parent
+                sys.exit(0) 
+        except OSError, e: 
+            sys.stderr.write(
+                "fork #2 failed: %d (%s)\n" % (e.errno, e.strerror))
+            sys.exit(1) 
+
+        self.forked = True
+        
+        # redirect standard file descriptors
+        sys.stdout.flush()
+        sys.stderr.flush()
+        si = file(self.stdin, 'r')
+        so = file(self.stdout, 'a+')
+        se = file(self.stderr, 'a+', 0)
+        os.dup2(si.fileno(), sys.stdin.fileno())
+        os.dup2(so.fileno(), sys.stdout.fileno())
+        os.dup2(se.fileno(), sys.stderr.fileno())
+
+        #making the mitmproxy subprocess run in same process group so that we
+        #can kill them at once
+        os.setsid()
+        
+        # write pidfile
+        atexit.register(self.delpid)
+        daemonHandlers.append(self.delpid)
+        pid = str(os.getpid())
+        file(self.pidfile,'w+').write("%s\n" % pid)
+
+    def delpid(self):
+        os.remove(self.pidfile)
+
+    def start(self):
+        """
+        Start the daemon
+        """
+        # Check for a pidfile to see if the daemon already runs
+        try:
+            pf = file(self.pidfile,'r')
+            pid = int(pf.read().strip())
+            pf.close()
+        except IOError:
+            pid = None
+
+        if pid:
+            if self.pidRunning(pid):
+                message = "pidfile %s already exist. Daemon already running?\n"
+                sys.stderr.write(message % self.pidfile)
+                sys.exit(1)
+            else:
+                print >> sys.stderr, "Stale pidfile, but no such process running, starting anyway"
+
+        # Start the daemon
+        logging.debug("Going to daemonize...")
+        self.daemonize()
+        logging.debug("Running main code...")
+        self.run()
+
+    def stop(self):
+        """
+        Stop the daemon
+        """
+        # Get the pid from the pidfile
+        try:
+            pf = file(self.pidfile,'r')
+            pid = int(pf.read().strip())
+            pf.close()
+        except IOError:
+            pid = None
+
+        if not pid:
+            message = "pidfile %s does not exist. Daemon not running?\n"
+            sys.stderr.write(message % self.pidfile)
+            return # not an error in a restart
+
+        # Try killing the daemon process    
+        try:
+            while 1:
+                os.kill(pid, signal.SIGTERM)
+                time.sleep(0.1)
+        except OSError, err:
+            err = str(err)
+            if err.find("No such process") > 0:
+                if os.path.exists(self.pidfile):
+                    os.remove(self.pidfile)
+            else:
+                print str(err)
+                sys.exit(1)
+
+    def restart(self):
+        """
+        Restart the daemon
+        """
+        self.stop()
+        self.start()
+
+    def run(self):
+        """
+        Subclasses should implemenent actual code
+        """
+        pass
+
+
+class MitmProxyDaemon(Daemon):
+    
+    def __init__(self, config, iface,
+        stdin='/dev/null', stdout='/dev/null', stderr='/dev/null'):
+        """
+        @param config: ConfigParser instance with config already read in
+        @param iface: interface name to bind to
+        @param stdin: filename to redirect stdin to
+        @param stdout: filename to redirect stdout to
+        @param stderr: filename to redirect stderr to
+        """
+        
+        self.config = config
+        self.iface = iface
+        Daemon.__init__(self, config.get("wrapper", "pidfile"), stdin, stdout, stderr)
+    
+    def run(self):
+        config = self.config
+        #ugly hack
+        try:
+            while True:
+                    ifaceAddr = ""
+                    if self.iface:
+                        try:
+                            ifaceAddr = getInterfaceIPv4Address(self.iface)
+                        except IOError:
+                            #iface lost IP address, is being renewed or iface lost
+                            time.sleep(1)
+                            continue
+                    
+                    args = [config.get("wrapper", "mitmproxy_executable"),
+                        "-H", config.get("mitmproxy", "target_host"),
+                        "-P", config.get("mitmproxy", "target_port"),
+                        "-p", config.get("mitmproxy", "local_port"),
+                        "-o", config.get("mitmproxy", "tty_log"),
+                        "-t", config.get("mitmproxy", "turris_id"),
+                        "-b", "/etc/mitmkeys/id_rsa.pub",
+                        "-B", "/etc/mitmkeys/id_rsa",
+                        "-i", ifaceAddr,
+                        ]
+                    
+                    logging.debug("Spawning mitmproxy")
+                    p = subprocess.Popen(args)
+                    p.wait()
+                    time.sleep(0.01) #prevent CPU hogging from subordinate process starting errors
+                    logging.debug(" mitmproxy over")
+        except KeyboardInterrupt:
+            pass #make it brekable by SIGINT
+        finally:
+            if self.forked:
+                self.stop()
+
+def convertLoglevel(levelString):
+	"""Converts string 'debug', 'info', etc. into corresponding
+	logging.XXX value which is returned.
+	
+	@raises ValueError if the level is undefined
+	"""
+	try:
+		return getattr(logging, levelString.upper())
+	except AttributeError:
+		raise ValueError("No such loglevel - %s" % levelString)
+
+def getInterfaceIPv4Address(ifname):
+    """
+    Return interface address or None if syscall failed.
+    
+    @throws IOError if interface does not exist
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    return socket.inet_ntoa(fcntl.ioctl(
+        s.fileno(),
+        0x8915,  # SIOCGIFADDR
+        struct.pack('256s', ifname[:15])
+    )[20:24])    
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print >> sys.stderr, "Usage: mitmproxy_wrapper.py mitmproxy_wrapper.conf"
+        sys.exit(2)
+        
+    configfile = sys.argv[1]
+    config = SafeConfigParser()
+    config.read(configfile)
+    
+    logfile = config.get("wrapper", "logfile")
+    loglevel = convertLoglevel(config.get("wrapper", "loglevel"))
+    logging.basicConfig(filename=logfile, level=loglevel,
+        format="%(asctime)s %(levelname)s %(message)s [%(pathname)s:%(lineno)d]")
+    
+    iface = config.get("wrapper", "interface")
+        
+    daemonize = config.getboolean("wrapper", "daemonize")
+    daemon = MitmProxyDaemon(config, iface)
+    signal.signal(signal.SIGINT, signalHandler)
+    signal.signal(signal.SIGTERM, signalHandler)
+    signal.signal(signal.SIGHUP, signalHandler)
+    
+    if daemonize:
+        daemon.start()
+    else:
+        daemon.run()
+    
